@@ -2,9 +2,11 @@ import time
 from typing import Optional
 
 import gymnasium as gym
+import imageio
 import numpy as np
 from gymnasium import spaces
 from gymnasium.envs.classic_control import utils
+from pydrake.solvers import MathematicalProgram, OsqpSolver
 
 from stable_baselines3 import A2C, PPO, SAC
 from stable_baselines3.common.env_util import make_vec_env
@@ -24,8 +26,8 @@ class MyEnv(gym.Env):
         self.nq = 2
         self.nv = 2
         self.nx = self.nq + self.nv
-        self.m = 0.1
-        self.g = np.array([0, -9.8], dtype=np.float32)
+        self.m = 1.0
+        self.g = np.array([0, -9.8*0], dtype=np.float32)
         self.state = None
 
         # Normalized action limits.
@@ -34,6 +36,13 @@ class MyEnv(gym.Env):
         # Define the action space to be the input force.
         self.action_space = spaces.Box(low=self.a_lb,
                                        high=self.a_ub, dtype=np.float32)
+
+        # Add linear action constraints.
+        self.project_action = True
+        self.lin_ineq_A = np.array([[1, 0], [-1, 0], [0, -1], [-1, 1], [2, 1]])
+        self.lin_ineq_b = np.array([5, 10, 5, 10, 10])
+        self.projection_verbose = False
+
         # Normalized action to force scale.
         self.a_to_f_scale = 1e1
 
@@ -78,6 +87,28 @@ class MyEnv(gym.Env):
         # Scale the action.
         force = action * self.a_to_f_scale
 
+        # Project the action into the constraint manifold.
+        if (self.project_action and
+                not (self.lin_ineq_A @ force <= self.lin_ineq_b).all()):
+            prog = MathematicalProgram()
+            f = prog.NewContinuousVariables(2)
+            prog.AddLinearConstraint(A=self.lin_ineq_A,
+                                     lb=-np.inf*np.ones(len(self.lin_ineq_b)),
+                                     ub=self.lin_ineq_b, vars=f)
+            prog.AddQuadraticErrorCost(Q=np.eye(2), x_desired=force, vars=f)
+            solver = OsqpSolver()
+            result = solver.Solve(prog)
+            cost = result.get_optimal_cost()
+            if self.projection_verbose:
+                print(f"\nSampled force:\t{force}")
+                print(f"Projected force:\t{result.GetSolution()}")
+                print(
+                    f"Cost: {cost}, assoc. reward: {np.exp(-cost/self.a_to_f_scale)}")
+                print(f"Success: {result.is_success()}")
+                print(f"Solve time: {result.get_solver_details().solve_time}")
+            # Set the control input to the projection solution.
+            force = result.GetSolution()
+
         # Get the current state.
         q = self.state[:self.nq]
         q_dot = self.state[self.nq:]
@@ -117,8 +148,8 @@ class MyEnv(gym.Env):
             # Weigh and sum the cost terms.
             # if distance_to_goal <= 1e-1:
             #     reward += 1
-            reward += np.exp(-5e0*task_cost)
-            reward += 1e-1*np.exp(-energy_cost)
+            reward += 1e1*np.exp(-5e0*task_cost)
+            reward += 1e-0*np.exp(-energy_cost)
             reward += 0e-3*np.exp(-effort_cost)
         else:
             reward = -1.0
@@ -189,26 +220,29 @@ class MyEnv(gym.Env):
             pygame.quit()
             self.isopen = False
 
+
 # Register the custom environment.
 gym.envs.register(id="Ball2d-v0",
                   entry_point="test_custom_env:MyEnv")  # noqa
 
 # Set the flags.
 TRAIN = True
+SAVE_GIF = False
+NUM_RESETS = 5
 
 # Train/test.
 if __name__ == "__main__":
     # Train the policy if opted.
     if TRAIN:
         # Create a vectorized environment to enable parallelization.
-        vec_env = make_vec_env("Ball2d-v0", n_envs=32, seed=0,
-                            vec_env_cls=SubprocVecEnv)
+        vec_env = make_vec_env("Ball2d-v0", n_envs=1, seed=0,
+                               vec_env_cls=SubprocVecEnv)
         # Train a model.
         print("\nTraining the policy...")
         model = PPO("MlpPolicy", vec_env, verbose=1,
                     tensorboard_log="./ball2d_tensorboard/",
-                    n_steps=200)
-        model.learn(total_timesteps=10000, tb_log_name="training")
+                    n_steps=500)
+        model.learn(total_timesteps=50000, tb_log_name="training")
 
         # Save the model.
         policy_file = "ball_2d_policy"
@@ -223,13 +257,24 @@ if __name__ == "__main__":
     # Evaluate the policy for a number of steps.
     vec_env = make_vec_env("Ball2d-v0", n_envs=1, seed=0,
                            vec_env_cls=SubprocVecEnv)
-    NRUNS = 5
-    for run_id in range(5):
-        input(f"\n\nPress enter to start Execution {run_id+1}/{NRUNS}")
+
+    # Evaluate the policy.
+    if SAVE_GIF:
+        render_mode = "rgb_array"
+    else:
+        render_mode = "human"
+    for run_id in range(NUM_RESETS):
+        input(f"\n\nPress enter to start Execution {run_id+1}/{NUM_RESETS}")
         obs = vec_env.reset()
+        img = vec_env.render(render_mode)
+        images = []
         for i in range(50):
+            images.append(img)
             action, _states = model.predict(obs, deterministic=True)
             obs, reward, done, info = vec_env.step(action)
             print(f"\ti: {i}, a: {action}, q: {obs[0]}")
-            vec_env.render("human")
+            img = vec_env.render(render_mode)
             time.sleep(0.1)
+        if SAVE_GIF:
+            imageio.mimsave(f"ball2d_{run_id}.gif",
+                            [np.array(img) for img in images])
